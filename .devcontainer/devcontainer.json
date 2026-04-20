@@ -1,0 +1,46 @@
+{
+  "name": "Python",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+
+  // Install Node.js so we can install Claude Code via npm
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "lts"
+    }
+  },
+
+  // Explicitly mount only this folder; prevents parent directory from being visible in the container
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/adr-agent,type=bind,consistency=cached",
+  "workspaceFolder": "/workspaces/adr-agent",
+
+  // Install Claude Code after the container is created
+  "postCreateCommand": "npm install -g @anthropic-ai/claude-code && mkdir -p ~/.claude && cp -r /tmp/claude-host/. ~/.claude/ && chmod 700 ~/.claude && chmod 600 ~/.claude/.credentials.json 2>/dev/null || true && cp /tmp/claude-host.json ~/.claude.json && chmod 600 ~/.claude.json",
+
+  "mounts": [
+    // Claude credentials — mount read-only to temp path; postCreateCommand copies with correct ownership
+    "source=${localEnv:USERPROFILE}/.claude,target=/tmp/claude-host,type=bind,readonly",
+    // Claude config file (.claude.json) lives at the home root, not inside .claude/
+    "source=${localEnv:USERPROFILE}/.claude.json,target=/tmp/claude-host.json,type=bind,readonly",
+
+    // Workspace is auto-mounted by VS Code at /workspaces/<folder>,
+    // so your files persist on the host automatically.
+    // Add extra named volumes here if you want to cache pip/venvs:
+    // "source=python-venv-cache,target=/home/vscode/.venv,type=volume"
+  ],
+
+  "remoteUser": "vscode",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.debugpy"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  }
+}

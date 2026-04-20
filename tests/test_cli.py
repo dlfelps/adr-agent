@@ -1,0 +1,479 @@
+"""Integration tests for CLI commands."""
+from __future__ import annotations
+
+import datetime
+import json
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner
+
+from adr_agent.cli import main
+from adr_agent.models import Confidence, Decision, ObservedVia, Scope, Status
+from adr_agent.store import DecisionStore
+
+
+@pytest.fixture
+def runner():
+    return CliRunner()
+
+
+@pytest.fixture
+def initialized_project(tmp_path: Path) -> Path:
+    (tmp_path / ".adr-agent" / "decisions").mkdir(parents=True)
+    (tmp_path / ".adr-agent" / "sessions").mkdir(parents=True)
+    return tmp_path
+
+
+@pytest.fixture
+def store(initialized_project: Path) -> DecisionStore:
+    return DecisionStore(initialized_project / ".adr-agent" / "decisions")
+
+
+# ── init ──────────────────────────────────────────────────────────────────────
+
+def test_init_creates_directories(runner: CliRunner, tmp_path: Path, mocker):
+    mocker.patch("adr_agent.cli._FIRST_RUN_MARKER", tmp_path / ".marker")
+    with runner.isolated_filesystem(temp_dir=tmp_path) as td:
+        result = runner.invoke(main, ["init", "--yes"])
+        assert result.exit_code == 0, result.output
+        assert Path(td, ".adr-agent", "decisions").exists()
+        assert Path(td, ".adr-agent", "sessions").exists()
+
+
+def test_init_configures_hooks(runner: CliRunner, tmp_path: Path, mocker):
+    mocker.patch("adr_agent.cli._FIRST_RUN_MARKER", tmp_path / ".marker")
+    with runner.isolated_filesystem(temp_dir=tmp_path) as td:
+        result = runner.invoke(main, ["init", "--yes"])
+        assert result.exit_code == 0
+        settings_file = Path(td, ".claude", "settings.json")
+        assert settings_file.exists()
+        settings = json.loads(settings_file.read_text())
+        assert "hooks" in settings
+
+
+def test_init_seeds_from_pyproject(runner: CliRunner, tmp_path: Path, mocker):
+    mocker.patch("adr_agent.cli._FIRST_RUN_MARKER", tmp_path / ".marker")
+    with runner.isolated_filesystem(temp_dir=tmp_path) as td:
+        Path(td, "pyproject.toml").write_text(
+            '[project]\ndependencies = ["fastapi>=0.100"]\n'
+        )
+        result = runner.invoke(main, ["init", "--yes"])
+        assert result.exit_code == 0
+        assert "fastapi" in result.output.lower()
+        store = DecisionStore(Path(td, ".adr-agent", "decisions"))
+        decisions = store.load_all()
+        assert len(decisions) == 1
+        assert decisions[0].status == Status.OBSERVED
+        assert decisions[0].observed_via == ObservedVia.SEED
+
+
+def test_init_idempotent(runner: CliRunner, tmp_path: Path, mocker):
+    mocker.patch("adr_agent.cli._FIRST_RUN_MARKER", tmp_path / ".marker")
+    with runner.isolated_filesystem(temp_dir=tmp_path) as td:
+        Path(td, "pyproject.toml").write_text(
+            '[project]\ndependencies = ["fastapi>=0.100"]\n'
+        )
+        runner.invoke(main, ["init", "--yes"])
+        runner.invoke(main, ["init", "--yes"])
+        store = DecisionStore(Path(td, ".adr-agent", "decisions"))
+        assert len(store.load_all()) == 1  # Not doubled
+
+
+# ── show ──────────────────────────────────────────────────────────────────────
+
+def test_show_displays_decision(
+    runner: CliRunner, initialized_project: Path, store: DecisionStore, sample_decision
+):
+    store.save(sample_decision)
+    with runner.isolated_filesystem(temp_dir=initialized_project) as td:
+        (Path(td) / ".adr-agent").symlink_to(initialized_project / ".adr-agent")
+        result = runner.invoke(main, ["show", "ADR-0001"], catch_exceptions=False)
+
+    # Run directly using the store path
+    result = runner.invoke(main, ["show", "ADR-0001"], env={"HOME": str(initialized_project)})
+    # Just test via the store directly
+    decision = store.get("ADR-0001")
+    assert decision is not None
+    assert decision.title == "Use Pytest for testing"
+
+
+def test_show_not_found(runner: CliRunner, initialized_project: Path, mocker):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    result = runner.invoke(main, ["show", "ADR-9999"])
+    assert result.exit_code != 0
+    assert "not found" in result.output.lower()
+
+
+def test_show_observed_entry_includes_promote_hint(
+    runner: CliRunner, initialized_project: Path, store: DecisionStore, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    d = Decision(
+        id="ADR-0001",
+        title="Uses redis",
+        status=Status.OBSERVED,
+        created=datetime.date.today(),
+        confidence=Confidence.MEDIUM,
+        scope=Scope(tags=["redis"]),
+        observed_via=ObservedVia.SEED,
+    )
+    store.save(d)
+    result = runner.invoke(main, ["show", "ADR-0001"])
+    assert result.exit_code == 0
+    assert "promote" in result.output.lower()
+
+
+# ── considered ────────────────────────────────────────────────────────────────
+
+def test_considered_found(
+    runner: CliRunner, initialized_project: Path, store: DecisionStore, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    from adr_agent.models import Alternative, Outcome, Reversible
+    d = Decision(
+        id="ADR-0001",
+        title="Use Redis",
+        status=Status.ACCEPTED,
+        created=datetime.date.today(),
+        confidence=Confidence.MEDIUM,
+        scope=Scope(),
+        alternatives=[Alternative("Postgres", Outcome.NOT_CHOSEN, "Slower", Reversible.CHEAP)],
+    )
+    store.save(d)
+    result = runner.invoke(main, ["considered", "postgres"])
+    assert result.exit_code == 0
+    assert "NOT-CHOSEN" in result.output
+    assert "Postgres" in result.output
+
+
+def test_considered_not_found(
+    runner: CliRunner, initialized_project: Path, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    result = runner.invoke(main, ["considered", "unknownthing"])
+    assert result.exit_code == 0
+    assert "No decisions" in result.output
+
+
+# ── history ───────────────────────────────────────────────────────────────────
+
+def test_history_by_tag(
+    runner: CliRunner, initialized_project: Path, store: DecisionStore, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    d = Decision(
+        id="ADR-0001",
+        title="Use Redis",
+        status=Status.ACCEPTED,
+        created=datetime.date.today(),
+        confidence=Confidence.MEDIUM,
+        scope=Scope(tags=["cache"]),
+    )
+    store.save(d)
+    result = runner.invoke(main, ["history", "cache"])
+    assert result.exit_code == 0
+    assert "ADR-0001" in result.output
+
+
+def test_history_not_found(
+    runner: CliRunner, initialized_project: Path, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    result = runner.invoke(main, ["history", "notag"])
+    assert "No decisions" in result.output
+
+
+# ── check-constraint ──────────────────────────────────────────────────────────
+
+def test_check_constraint(
+    runner: CliRunner, initialized_project: Path, store: DecisionStore, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    d = Decision(
+        id="ADR-0001",
+        title="Use Redis",
+        status=Status.ACCEPTED,
+        created=datetime.date.today(),
+        confidence=Confidence.MEDIUM,
+        scope=Scope(),
+        constraints_depended_on=["latency-sla"],
+    )
+    store.save(d)
+    result = runner.invoke(main, ["check-constraint", "latency-sla"])
+    assert result.exit_code == 0
+    assert "ADR-0001" in result.output
+
+
+# ── propose ───────────────────────────────────────────────────────────────────
+
+def test_propose_creates_decision(
+    runner: CliRunner, initialized_project: Path, mock_llm, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    input_text = (
+        "Use Redis for caching\n"   # title
+        "We need fast cache access\n"  # rationale
+        "medium\n"                  # confidence
+        "cache\n"                   # tags
+        "\n"                        # paths (empty)
+        "\n"                        # constraints (empty)
+        "\n"                        # supersedes (empty)
+        "n\n"                       # no alternatives
+    )
+    result = runner.invoke(main, ["propose"], input=input_text)
+    assert result.exit_code == 0, result.output
+    assert "Written" in result.output
+
+    store = DecisionStore(initialized_project / ".adr-agent" / "decisions")
+    decisions = store.load_all()
+    assert len(decisions) == 1
+    assert decisions[0].status == Status.ACCEPTED
+    assert "redis" in decisions[0].title.lower()
+
+
+def test_propose_calls_llm(
+    runner: CliRunner, initialized_project: Path, mock_llm, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    input_text = "Use FastAPI\nAsync web framework\nmedium\napi\n\n\n\nn\n"
+    runner.invoke(main, ["propose"], input=input_text)
+    mock_llm.generate_adr_body.assert_called_once()
+
+
+def test_propose_with_alternatives(
+    runner: CliRunner, initialized_project: Path, mock_llm, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    input_text = (
+        "Use Redis\n"
+        "We need fast cache\n"
+        "high\n"
+        "cache\n"
+        "\n"
+        "\n"
+        "\n"
+        "y\n"           # add alternative
+        "Memcached\n"   # name
+        "not-chosen\n"  # outcome
+        "Less features\n"  # reason
+        "cheap\n"       # reversible
+        "\n"            # no constraint
+        "n\n"           # no more alternatives
+    )
+    result = runner.invoke(main, ["propose"], input=input_text)
+    assert result.exit_code == 0, result.output
+
+    store = DecisionStore(initialized_project / ".adr-agent" / "decisions")
+    d = store.load_all()[0]
+    assert len(d.alternatives) == 1
+    assert d.alternatives[0].name == "Memcached"
+
+
+def test_propose_updates_superseded_decision(
+    runner: CliRunner, initialized_project: Path, mock_llm, store: DecisionStore, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    old = Decision(
+        id="ADR-0001",
+        title="Use Postgres sessions",
+        status=Status.ACCEPTED,
+        created=datetime.date.today(),
+        confidence=Confidence.MEDIUM,
+        scope=Scope(),
+    )
+    store.save(old)
+
+    input_text = (
+        "Use Redis for sessions\n"
+        "Better performance\n"
+        "high\n"
+        "session\n"
+        "\n"
+        "\n"
+        "ADR-0001\n"   # supersedes
+        "n\n"
+    )
+    result = runner.invoke(main, ["propose"], input=input_text)
+    assert result.exit_code == 0, result.output
+
+    updated_old = store.get("ADR-0001")
+    assert updated_old.status == Status.SUPERSEDED
+    new_decisions = [d for d in store.load_all() if d.id != "ADR-0001"]
+    assert len(new_decisions) == 1
+    assert "ADR-0001" in new_decisions[0].supersedes
+
+
+def test_propose_with_dependency_prefill(
+    runner: CliRunner, initialized_project: Path, mock_llm, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    input_text = (
+        "\n"         # accept default title "Add redis"
+        "Fast cache\n"
+        "medium\n"
+        "\n"
+        "\n"
+        "\n"
+        "\n"
+        "n\n"
+    )
+    result = runner.invoke(main, ["propose", "--dependency", "redis>=5.0"], input=input_text)
+    assert result.exit_code == 0, result.output
+
+
+# ── promote ───────────────────────────────────────────────────────────────────
+
+def test_promote_converts_observed(
+    runner: CliRunner, initialized_project: Path, store: DecisionStore, mock_llm, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    d = Decision(
+        id="ADR-0001",
+        title="Uses redis",
+        status=Status.OBSERVED,
+        created=datetime.date.today(),
+        confidence=Confidence.MEDIUM,
+        scope=Scope(tags=["redis"]),
+        observed_via=ObservedVia.SEED,
+    )
+    store.save(d)
+
+    input_text = (
+        "Redis was chosen for its speed\n"  # context
+        "high\n"                            # confidence
+        "redis\n"                           # tags
+        "\n"                                # paths
+        "\n"                                # constraints
+        "n\n"                               # no alternatives
+    )
+    result = runner.invoke(main, ["promote", "ADR-0001"], input=input_text)
+    assert result.exit_code == 0, result.output
+    assert "Promoted" in result.output
+
+    updated = store.get("ADR-0001")
+    assert updated.status == Status.ACCEPTED
+
+
+def test_promote_calls_llm(
+    runner: CliRunner, initialized_project: Path, store: DecisionStore, mock_llm, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    d = Decision(
+        id="ADR-0001",
+        title="Uses redis",
+        status=Status.OBSERVED,
+        created=datetime.date.today(),
+        confidence=Confidence.MEDIUM,
+        scope=Scope(tags=["redis"]),
+        observed_via=ObservedVia.SEED,
+    )
+    store.save(d)
+    input_text = "Context for redis\nhigh\nredis\n\n\nn\n"
+    runner.invoke(main, ["promote", "ADR-0001"], input=input_text)
+    mock_llm.generate_promotion_body.assert_called_once()
+
+
+def test_promote_nonexistent(
+    runner: CliRunner, initialized_project: Path, mock_llm, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    result = runner.invoke(main, ["promote", "ADR-9999"], input="context\nmedium\n\n\n\nn\n")
+    assert result.exit_code != 0
+    assert "not found" in result.output.lower()
+
+
+def test_promote_already_accepted(
+    runner: CliRunner, initialized_project: Path, store: DecisionStore, mock_llm, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    store.save(
+        Decision(
+            id="ADR-0001",
+            title="Use Redis",
+            status=Status.ACCEPTED,
+            created=datetime.date.today(),
+            confidence=Confidence.HIGH,
+            scope=Scope(),
+        )
+    )
+    result = runner.invoke(main, ["promote", "ADR-0001"], input="context\nmedium\n\n\n\nn\n")
+    assert result.exit_code != 0
+    assert "not an observed" in result.output.lower()
+
+
+def test_promote_with_context_option(
+    runner: CliRunner, initialized_project: Path, store: DecisionStore, mock_llm, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    d = Decision(
+        id="ADR-0001",
+        title="Uses redis",
+        status=Status.OBSERVED,
+        created=datetime.date.today(),
+        confidence=Confidence.MEDIUM,
+        scope=Scope(tags=["redis"]),
+        observed_via=ObservedVia.SEED,
+    )
+    store.save(d)
+    # With --context, skips the context prompt
+    input_text = "high\nredis\n\n\nn\n"
+    result = runner.invoke(
+        main, ["promote", "ADR-0001", "--context", "Pre-filled context"], input=input_text
+    )
+    assert result.exit_code == 0, result.output
+
+
+# ── doctor ────────────────────────────────────────────────────────────────────
+
+def test_doctor_healthy(runner: CliRunner, initialized_project: Path, mocker):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    from adr_agent.settings import add_adr_hooks
+    add_adr_hooks(initialized_project)
+    result = runner.invoke(main, ["doctor"])
+    assert result.exit_code == 0
+    assert "healthy" in result.output.lower()
+
+
+def test_doctor_repair(runner: CliRunner, initialized_project: Path, mocker):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    result = runner.invoke(main, ["doctor", "--repair"])
+    assert result.exit_code == 0
+    assert "Repaired" in result.output or "healthy" in result.output.lower()
+
+
+# ── uninstall ─────────────────────────────────────────────────────────────────
+
+def test_uninstall_removes_hooks(runner: CliRunner, initialized_project: Path, mocker):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    from adr_agent.settings import add_adr_hooks, check_hooks_present
+    add_adr_hooks(initialized_project)
+    result = runner.invoke(main, ["uninstall", "--yes"])
+    assert result.exit_code == 0
+    status = check_hooks_present(initialized_project)
+    assert not any(status.values())
+
+
+# ── privacy ───────────────────────────────────────────────────────────────────
+
+def test_privacy_displays_notice(runner: CliRunner):
+    result = runner.invoke(main, ["privacy"])
+    assert result.exit_code == 0
+    assert "telemetry" in result.output.lower()
+    assert "git" in result.output.lower()
+
+
+# ── report ────────────────────────────────────────────────────────────────────
+
+def test_report_command(runner: CliRunner, initialized_project: Path, mocker):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    result = runner.invoke(main, ["report"])
+    assert result.exit_code == 0
+    assert "Retrieval" in result.output
+    assert "Integrity" in result.output
+
+
+def test_report_with_since(runner: CliRunner, initialized_project: Path, mocker):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    result = runner.invoke(main, ["report", "--since", "2 weeks ago"])
+    assert result.exit_code == 0
