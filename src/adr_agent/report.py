@@ -68,7 +68,7 @@ def generate_report(sessions_dir: Path, store: DecisionStore, since_str: Optiona
     voluntary = [e for e in events if e.get("event_type") == "voluntary"]
     automated = [e for e in events if e.get("event_type") == "automated"]
 
-    retrieval_cmds = {"show", "considered", "history", "check-constraint"}
+    retrieval_cmds = {"show", "plan", "history", "check-constraint"}
     write_cmds = {"propose", "promote"}
 
     retrieval_events = [e for e in voluntary if e.get("command") in retrieval_cmds]
@@ -78,7 +78,7 @@ def generate_report(sessions_dir: Path, store: DecisionStore, since_str: Optiona
     write_counts: Counter = Counter(e.get("command") for e in write_events)
 
     most_viewed = _most_common_targets(retrieval_events, "show")
-    most_queried = _most_common_targets(retrieval_events, "considered")
+    most_queried = _most_common_targets(retrieval_events, "plan")
 
     reconciliation_events = [e for e in automated if e.get("command") == "reconciliation"]
     session_start_recon = len([e for e in reconciliation_events if "session" in e.get("targets", [])])
@@ -101,13 +101,14 @@ def generate_report(sessions_dir: Path, store: DecisionStore, since_str: Optiona
 
     total_retrieval = sum(retrieval_counts.values())
     lines.append(f"Retrieval ({total_retrieval} voluntary queries)")
-    for cmd in ("show", "considered", "history", "check-constraint"):
+    for cmd in ("show", "plan", "history", "check-constraint"):
         count = retrieval_counts.get(cmd, 0)
         extra = ""
         if cmd == "show" and most_viewed:
             extra = f"   most-viewed: {', '.join(most_viewed)}"
-        elif cmd == "considered" and most_queried:
-            extra = f"   most-queried: {', '.join(most_queried)}"
+        elif cmd == "plan" and most_queried:
+            truncated = [t[:40] + "..." if len(t) > 40 else t for t in most_queried]
+            extra = f"   most-queried topics: {', '.join(truncated)}"
         lines.append(f"  {cmd:<20} {count}{extra}")
 
     lines.append("")

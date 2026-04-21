@@ -64,7 +64,7 @@ def _build_brief(store: DecisionStore, new_observed: list[str]) -> str:
             lines.append(f"  {d.id}  {d.title}{tag}")
 
     lines.append("\nRun `adr-agent show <id>` for full rationale and alternatives.")
-    lines.append("Run `adr-agent considered <topic>` to see what has been evaluated before.")
+    lines.append('Run `adr-agent plan "<prompt>"` to get relevant context before starting a task.')
     lines.append("Run `adr-agent propose` to record a new decision or supersession.")
     lines.append("Run `adr-agent promote <id>` to capture rationale for an observed entry.")
     return "\n".join(lines)

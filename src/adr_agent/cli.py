@@ -15,7 +15,7 @@ from .reconciler import get_runtime_deps, reconcile
 from .report import generate_report
 from .session import EventLogger, SessionState, get_current_session_id
 from .settings import add_adr_hooks, check_hooks_present, remove_adr_hooks
-from .store import DecisionStore, create_observed
+from .store import DecisionStore, STOP_WORDS, create_observed, tokenize
 
 
 def _find_project_root() -> Path:
@@ -49,15 +49,25 @@ def _get_logger(project_root: Path) -> Optional[EventLogger]:
     return None
 
 
+def _first_sentence(text: str) -> str:
+    if not text:
+        return ""
+    for sep in (".", "!", "?", "\n"):
+        idx = text.find(sep)
+        if 0 < idx < 150:
+            return text[: idx + 1].strip()
+    return text[:150].strip()
+
+
 _PRIVACY_NOTICE = """\
 adr-agent records architectural decisions for use by AI agents.
 
 Before initializing, please note:
 
-1. Decision files are committed to git and become part of your
-   repository's permanent history. Rationale and alternatives will
-   be visible to everyone with repo access. Treat them with the
-   same sensitivity as source code.
+1. Decision files and the decision index are committed to git and become
+   part of your repository's permanent history. Rationale and alternatives
+   will be visible to everyone with repo access. Treat them with the same
+   sensitivity as source code.
 
 2. Session logs are stored locally under .adr-agent/sessions/ and
    are gitignored by default. They contain command metadata, not
@@ -68,6 +78,25 @@ Before initializing, please note:
 
 4. The aggregate pattern of decisions can reveal information even
    when individual decisions are innocuous.
+"""
+
+_FIRST_RUN_AUDIT_PROMPT = """\
+"I have just initialized adr-agent in this repository. Review the list
+of **OBSERVED** dependencies provided in the architecture brief.
+
+For each central dependency (e.g., the web framework, database client,
+or CLI library):
+
+1. **Research** why it was likely chosen over common alternatives by
+   examining the code, imports, and documentation.
+2. **Analyze** the pros and cons of this choice in the context of this
+   specific project.
+3. **Execute** `adr-agent promote <id>` to convert these into **ACCEPTED**
+   entries. Include the rationale and at least one alternative considered
+   in the promotion flow.
+
+If you cannot find evidence for why a dependency was chosen, leave it as
+'Observed' to maintain store integrity."
 """
 
 _FIRST_RUN_MARKER = Path.home() / ".adr-agent-initialized"
@@ -127,6 +156,16 @@ def init(yes: bool) -> None:
         click.echo(f"Seeded {len(seeded)} observed entr{'y' if len(seeded)==1 else 'ies'} from pyproject.toml:")
         for pkg in seeded:
             click.echo(f"  {pkg}")
+        n = len(seeded)
+        click.echo(
+            f"\nadr-agent has seeded {n} observed {'entry' if n == 1 else 'entries'} "
+            "from your existing dependencies.\n"
+            "These entries reflect what the codebase uses but contain no rationale.\n\n"
+            "To backfill rationale for existing dependencies, ask your AI agent to\n"
+            "run the First-Run Audit:\n"
+        )
+        click.echo(_FIRST_RUN_AUDIT_PROMPT)
+        click.echo("(You can display this prompt again with `adr-agent first-run-audit`.)")
     click.echo("Hooks configured in .claude/settings.json.")
 
 
@@ -185,50 +224,108 @@ def show(adr_id: str) -> None:
         )
 
 
-# ── considered ────────────────────────────────────────────────────────────────
+# ── plan ──────────────────────────────────────────────────────────────────────
 
 @main.command()
-@click.argument("topic")
-def considered(topic: str) -> None:
-    """Show all decisions where TOPIC was evaluated as an alternative."""
+@click.argument("prompt")
+def plan(prompt: str) -> None:
+    """Get relevant architectural context for a task before starting."""
     project_root = _find_project_root()
     _require_initialized(project_root)
     store = _make_store(project_root)
 
     logger = _get_logger(project_root)
     if logger:
-        logger.log_voluntary("considered", [topic])
+        logger.log_voluntary("plan", [prompt[:200]])
 
-    results = store.search_alternatives(topic)
-    if not results:
-        click.echo(f"No decisions found where '{topic}' was considered.")
+    terms = tokenize(prompt) - STOP_WORDS
+    if not terms:
+        click.echo("No meaningful terms found in prompt.")
+        click.echo("Run `adr-agent propose` when ready to record a decision.")
         return
 
-    by_outcome: dict[str, list] = {"chosen": [], "not-chosen": [], "rejected": []}
-    for decision, alts in results:
-        for alt in alts:
-            by_outcome[alt.outcome.value].append((decision, alt))
+    candidates = store.search_by_terms(terms)
+    if not candidates:
+        click.echo("No relevant decisions found for this task.")
+        click.echo("Run `adr-agent propose` when ready to record a decision.")
+        return
 
-    labels = {"chosen": "CHOSEN", "not-chosen": "NOT-CHOSEN", "rejected": "REJECTED"}
-    for outcome, label in labels.items():
-        entries = by_outcome[outcome]
-        if not entries:
-            continue
-        click.echo(label)
-        for decision, alt in entries:
-            sup = f" superseded by {decision.superseded_by[0]}" if decision.superseded_by else ""
-            click.echo(f"  {decision.id} ({decision.created}) [{alt.name}] for {_infer_purpose(decision)}{sup}")
-            click.echo(f'    "{alt.reason}"')
-            click.echo(f"    reversible: {alt.reversible.value}")
+    accepted = [d for d in candidates if d.status == Status.ACCEPTED]
+    observed = [d for d in candidates if d.status == Status.OBSERVED]
 
+    lines: list[str] = []
 
-def _infer_purpose(decision) -> str:
-    title = decision.title.lower()
-    if title.startswith("use "):
-        return title[4:]
-    if title.startswith("uses "):
-        return title[5:]
-    return title[:40]
+    if accepted:
+        lines.append("RELEVANT DECISIONS")
+        for d in sorted(accepted, key=lambda x: x.created, reverse=True):
+            lines.append(f"  {d.id} ({d.status.value}) {d.title}")
+            snippet = _first_sentence(d.decision_text)
+            if snippet:
+                lines.append(f"    {snippet}")
+
+    if observed:
+        if lines:
+            lines.append("")
+        lines.append("OBSERVED ENTRIES THAT MAY BE AFFECTED")
+        for d in sorted(observed, key=lambda x: x.created, reverse=True):
+            lines.append(f"  {d.id} {d.title} (no rationale captured)")
+
+    # Group alternatives by name, collecting (alt, decision) pairs
+    alt_groups: dict[str, list[tuple]] = {}
+    for d in candidates:
+        for alt in d.alternatives:
+            if alt.outcome in (Outcome.NOT_CHOSEN, Outcome.REJECTED):
+                key = alt.name.lower()
+                alt_groups.setdefault(key, []).append((alt, d))
+
+    if alt_groups:
+        if lines:
+            lines.append("")
+        lines.append("WHAT HAS BEEN CONSIDERED")
+        for entries in alt_groups.values():
+            first_alt = entries[0][0]
+            lines.append(f"  {first_alt.name}")
+            for alt, d in entries:
+                label = "NOT-CHOSEN" if alt.outcome == Outcome.NOT_CHOSEN else "REJECTED"
+                lines.append(
+                    f'    {label} in {d.id} ({d.created}): "{alt.reason}" — reversible: {alt.reversible.value}'
+                )
+            if any(alt.outcome == Outcome.NOT_CHOSEN for alt, _ in entries):
+                lines.append("    This alternative may be worth revisiting if conditions have changed.")
+
+    # Collect constraints from matching decisions and their alternatives
+    constraints_map: dict[str, list[str]] = {}
+    for d in candidates:
+        for c in d.constraints_depended_on:
+            constraints_map.setdefault(c, [])
+            if d.id not in constraints_map[c]:
+                constraints_map[c].append(d.id)
+        for alt in d.alternatives:
+            if alt.constraint:
+                constraints_map.setdefault(alt.constraint, [])
+                if d.id not in constraints_map[alt.constraint]:
+                    constraints_map[alt.constraint].append(d.id)
+
+    if constraints_map:
+        if lines:
+            lines.append("")
+        lines.append("ACTIVE CONSTRAINTS RELEVANT TO THIS TASK")
+        for constraint, refs in sorted(constraints_map.items()):
+            lines.append(f"  {constraint} (referenced by {', '.join(refs)})")
+            for ref_id in refs:
+                ref_d = next((d for d in candidates if d.id == ref_id), None) or store.get(ref_id)
+                if ref_d and ref_d.decision_text:
+                    snippet = _first_sentence(ref_d.decision_text)
+                    if snippet:
+                        lines.append(f"    {snippet}")
+                    break
+
+    if lines:
+        lines.append("")
+    lines.append("Run `adr-agent show <id>` for full rationale on any entry above.")
+    lines.append("Run `adr-agent propose` when you are ready to record your decision.")
+
+    click.echo("\n".join(lines))
 
 
 # ── history ───────────────────────────────────────────────────────────────────
@@ -301,7 +398,6 @@ def propose(dependency: Optional[str], relevant_adrs: Optional[str], scope_path:
     default_title = f"Add {dependency}" if dependency else ""
     default_scope_tags = dependency or ""
     default_scope_paths = scope_path or ""
-    default_supersedes = ""
 
     relevant_decisions = []
     if relevant_adrs:
@@ -323,9 +419,7 @@ def propose(dependency: Optional[str], relevant_adrs: Optional[str], scope_path:
     tags_raw = click.prompt("Scope tags (comma-separated, or empty)", default=default_scope_tags)
     paths_raw = click.prompt("Scope paths (comma-separated, or empty)", default=default_scope_paths)
     constraints_raw = click.prompt("Constraints depended on (comma-separated, or empty)", default="")
-    supersedes_raw = click.prompt(
-        "Supersedes (ADR IDs, comma-separated, or empty)", default=default_supersedes
-    )
+    supersedes_raw = click.prompt("Supersedes (ADR IDs, comma-separated, or empty)", default="")
 
     tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
     paths = [p.strip() for p in paths_raw.split(",") if p.strip()]
@@ -365,13 +459,6 @@ def propose(dependency: Optional[str], relevant_adrs: Optional[str], scope_path:
         constraints=constraints,
         supersedes=supersedes,
     )
-
-    # Update superseded decisions
-    for sup_id in supersedes:
-        sup_decision = store.get(sup_id)
-        if sup_decision:
-            # Will be updated by saving later; track forward link
-            pass
 
     adr_id = store.next_id()
     from .models import Decision
@@ -490,7 +577,6 @@ def promote(adr_id: str, context_text: Optional[str]) -> None:
     decision.context_text = new_context
     decision.decision_text = new_decision
     decision.consequences_text = new_consequences
-    # Preserve observed_via in frontmatter for reporting purposes
 
     path = store.save(decision)
 
@@ -499,6 +585,24 @@ def promote(adr_id: str, context_text: Optional[str]) -> None:
         logger.log_voluntary("promote", [decision.id])
 
     click.echo(f"\nPromoted {decision.id} to accepted. Written: {path}")
+
+
+# ── rebuild-index ─────────────────────────────────────────────────────────────
+
+@main.command("rebuild-index")
+def rebuild_index() -> None:
+    """Rebuild the inverted index from all decision files."""
+    project_root = _find_project_root()
+    _require_initialized(project_root)
+    store = _make_store(project_root)
+
+    logger = _get_logger(project_root)
+    if logger:
+        logger.log("maintenance", "rebuild-index")
+
+    store.rebuild_index()
+    count = len(store.load_all())
+    click.echo(f"Index rebuilt from {count} decision {'file' if count == 1 else 'files'}.")
 
 
 # ── report ────────────────────────────────────────────────────────────────────
@@ -566,6 +670,14 @@ def uninstall(yes: bool) -> None:
 def privacy() -> None:
     """Display the privacy notice."""
     click.echo(_PRIVACY_NOTICE)
+
+
+# ── first-run-audit ───────────────────────────────────────────────────────────
+
+@main.command("first-run-audit")
+def first_run_audit() -> None:
+    """Display the First-Run Audit prompt for backfilling observed entries."""
+    click.echo(_FIRST_RUN_AUDIT_PROMPT)
 
 
 # ── hook subcommands ──────────────────────────────────────────────────────────

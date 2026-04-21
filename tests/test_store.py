@@ -15,7 +15,7 @@ from adr_agent.models import (
     Scope,
     Status,
 )
-from adr_agent.store import DecisionStore, create_observed
+from adr_agent.store import DecisionStore, create_observed, tokenize
 
 
 def test_save_and_load(store: DecisionStore, sample_decision: Decision):
@@ -149,24 +149,77 @@ def test_find_covering_excludes_superseded(store: DecisionStore):
     assert results == []
 
 
-def test_search_alternatives(store: DecisionStore):
+def test_save_updates_index(store: DecisionStore):
     d = Decision(
         id="ADR-0001",
-        title="Use Redis",
+        title="Use Redis for caching",
+        status=Status.ACCEPTED,
+        created=datetime.date.today(),
+        confidence=Confidence.MEDIUM,
+        scope=Scope(tags=["cache"]),
+    )
+    store.save(d)
+    index = store._load_index()
+    assert "redis" in index
+    assert "ADR-0001" in index["redis"]
+    assert "cache" in index
+    assert "ADR-0001" in index["cache"]
+
+
+def test_rebuild_index(store: DecisionStore):
+    for i, title in enumerate(["Use Redis", "Use Postgres"], start=1):
+        d = Decision(
+            id=f"ADR-{i:04d}",
+            title=title,
+            status=Status.ACCEPTED,
+            created=datetime.date.today(),
+            confidence=Confidence.MEDIUM,
+            scope=Scope(),
+        )
+        store.save(d)
+    # Wipe index manually, then rebuild
+    store._save_index({})
+    assert store._load_index() == {}
+    store.rebuild_index()
+    index = store._load_index()
+    assert "redis" in index
+    assert "postgres" in index
+
+
+def test_search_by_terms_finds_matching(store: DecisionStore):
+    d = Decision(
+        id="ADR-0001",
+        title="Use Redis for sessions",
+        status=Status.ACCEPTED,
+        created=datetime.date.today(),
+        confidence=Confidence.MEDIUM,
+        scope=Scope(tags=["session"]),
+    )
+    store.save(d)
+    results = store.search_by_terms({"redis"})
+    assert len(results) == 1
+    assert results[0].id == "ADR-0001"
+
+
+def test_search_by_terms_no_match(store: DecisionStore, sample_decision: Decision):
+    store.save(sample_decision)
+    results = store.search_by_terms({"unknownxyz"})
+    assert results == []
+
+
+def test_search_by_terms_stemming(store: DecisionStore):
+    d = Decision(
+        id="ADR-0001",
+        title="Use caching layer",
         status=Status.ACCEPTED,
         created=datetime.date.today(),
         confidence=Confidence.MEDIUM,
         scope=Scope(),
-        alternatives=[
-            Alternative("Postgres", Outcome.NOT_CHOSEN, "Too slow", Reversible.CHEAP),
-        ],
     )
     store.save(d)
-    results = store.search_alternatives("postgres")
+    # "caching" in title → stem → "cach"; searching "caches" should also stem → "cach"
+    results = store.search_by_terms({"caching"})
     assert len(results) == 1
-    decision, alts = results[0]
-    assert decision.id == "ADR-0001"
-    assert alts[0].name == "Postgres"
 
 
 def test_history_by_tag(store: DecisionStore):

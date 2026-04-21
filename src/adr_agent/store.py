@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime
+import json
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -8,10 +10,40 @@ import frontmatter
 
 from .models import Decision, ObservedVia, Scope, Status
 
+_STOP_WORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "is", "it", "in", "on", "at", "to", "for", "of", "and",
+    "or", "but", "not", "we", "use", "used", "by", "with", "this", "was",
+    "has", "have", "had", "be", "been", "as", "are", "were", "that", "from",
+    "its", "our", "their", "there", "these", "those", "which", "when", "where",
+    "how", "all", "would", "could", "should", "may", "might", "can", "will",
+    "do", "did", "does", "if", "so", "no", "any", "up", "out", "about", "into",
+    "than", "more", "also", "each", "both", "new", "per", "via", "add",
+    "get", "set", "run", "make", "take", "give",
+})
+
+STOP_WORDS = _STOP_WORDS
+
+
+def tokenize(text: str) -> set[str]:
+    """Split text into lowercase tokens, filtering single-character tokens."""
+    return {w.lower() for w in re.split(r"[^a-zA-Z0-9]+", text) if len(w) > 1}
+
+
+def _stem(word: str) -> str:
+    for suffix in ("ings", "tions", "tion", "ations", "ation", "ness", "ied",
+                   "ies", "ing", "ed", "ly", "es", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) > 2:
+            return word[: -len(suffix)]
+    return word
+
 
 class DecisionStore:
     def __init__(self, decisions_dir: Path):
         self.decisions_dir = decisions_dir
+
+    @property
+    def _index_path(self) -> Path:
+        return self.decisions_dir.parent / "index.json"
 
     def load_all(self) -> list[Decision]:
         if not self.decisions_dir.exists():
@@ -38,6 +70,7 @@ class DecisionStore:
         body = _build_body(decision)
         post = frontmatter.Post(body, **decision.to_frontmatter())
         path.write_text(frontmatter.dumps(post))
+        self._update_index(decision)
         return path
 
     def next_id(self) -> str:
@@ -61,16 +94,6 @@ class DecisionStore:
                 results.append(d)
         return results
 
-    def search_alternatives(self, topic: str) -> list[tuple[Decision, list]]:
-        """Return decisions that mention topic as an alternative name."""
-        topic_lower = topic.lower()
-        results = []
-        for d in self.load_all():
-            matches = [a for a in d.alternatives if topic_lower in a.name.lower()]
-            if matches:
-                results.append((d, matches))
-        return results
-
     def history(self, path_or_tag: str) -> list[Decision]:
         """All decisions (including superseded) covering a path or tag."""
         needle = path_or_tag.lower()
@@ -92,6 +115,77 @@ class DecisionStore:
             alt_matches = [a for a in d.alternatives if a.constraint and tag_lower == a.constraint.lower()]
             if decision_matches or alt_matches:
                 results.append((d, alt_matches))
+        return results
+
+    # ── Index management ──────────────────────────────────────────────────────
+
+    def _load_index(self) -> dict[str, list[str]]:
+        if self._index_path.exists():
+            try:
+                return json.loads(self._index_path.read_text())
+            except Exception:
+                pass
+        return {}
+
+    def _save_index(self, index: dict[str, list[str]]) -> None:
+        self._index_path.parent.mkdir(parents=True, exist_ok=True)
+        self._index_path.write_text(json.dumps(index, sort_keys=True))
+
+    def _extract_terms(self, decision: Decision) -> set[str]:
+        terms: set[str] = set()
+        terms.update(tokenize(decision.title) - _STOP_WORDS)
+        terms.update(t.lower() for t in decision.scope.tags)
+        terms.update(c.lower() for c in decision.constraints_depended_on)
+        for alt in decision.alternatives:
+            terms.update(tokenize(alt.name) - _STOP_WORDS)
+            if alt.constraint:
+                terms.add(alt.constraint.lower())
+        for text in (decision.context_text, decision.decision_text):
+            for w in tokenize(text):
+                if w not in _STOP_WORDS and len(w) > 2:
+                    terms.add(_stem(w))
+        return terms
+
+    def _update_index(self, decision: Decision) -> None:
+        index = self._load_index()
+        for ids in index.values():
+            try:
+                ids.remove(decision.id)
+            except ValueError:
+                pass
+        index = {k: v for k, v in index.items() if v}
+        for term in self._extract_terms(decision):
+            if term not in index:
+                index[term] = []
+            if decision.id not in index[term]:
+                index[term].append(decision.id)
+        self._save_index(index)
+
+    def rebuild_index(self) -> None:
+        """Rebuild the full index from all decision files."""
+        index: dict[str, list[str]] = {}
+        for decision in self.load_all():
+            for term in self._extract_terms(decision):
+                if term not in index:
+                    index[term] = []
+                if decision.id not in index[term]:
+                    index[term].append(decision.id)
+        self._save_index(index)
+
+    def search_by_terms(self, terms: set[str]) -> list[Decision]:
+        """Find decisions matching any of the given terms via the index."""
+        index = self._load_index()
+        candidate_ids: set[str] = set()
+        for term in terms:
+            candidate_ids.update(index.get(term, []))
+            stemmed = _stem(term)
+            if stemmed != term:
+                candidate_ids.update(index.get(stemmed, []))
+        results = []
+        for adr_id in sorted(candidate_ids):
+            d = self.get(adr_id)
+            if d is not None:
+                results.append(d)
         return results
 
     def _read(self, path: Path) -> Decision:

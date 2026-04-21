@@ -55,7 +55,7 @@ def test_load_events_empty(sessions_dir: Path):
 
 def test_load_events_basic(sessions_dir: Path):
     _write_event(sessions_dir, "sess-001", "voluntary", "show", ["ADR-0001"])
-    _write_event(sessions_dir, "sess-001", "voluntary", "considered", ["redis"])
+    _write_event(sessions_dir, "sess-001", "voluntary", "plan", ["add a redis cache"])
     events = load_events(sessions_dir)
     assert len(events) == 2
 
@@ -88,7 +88,7 @@ def test_generate_report_counts_voluntary(tmp_path: Path):
 
     _write_event(sessions_dir, "s1", "voluntary", "show", ["ADR-0001"])
     _write_event(sessions_dir, "s1", "voluntary", "show", ["ADR-0002"])
-    _write_event(sessions_dir, "s1", "voluntary", "considered", ["redis"])
+    _write_event(sessions_dir, "s1", "voluntary", "plan", ["add a redis cache"])
     _write_event(sessions_dir, "s1", "voluntary", "propose", ["ADR-0003"])
 
     report = generate_report(sessions_dir, store)

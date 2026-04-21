@@ -66,6 +66,9 @@ def test_init_seeds_from_pyproject(runner: CliRunner, tmp_path: Path, mocker):
         assert len(decisions) == 1
         assert decisions[0].status == Status.OBSERVED
         assert decisions[0].observed_via == ObservedVia.SEED
+        # v1.1: First-Run Audit prompt should appear when deps are seeded
+        assert "First-Run Audit" in result.output
+        assert "first-run-audit" in result.output
 
 
 def test_init_idempotent(runner: CliRunner, tmp_path: Path, mocker):
@@ -124,36 +127,128 @@ def test_show_observed_entry_includes_promote_hint(
     assert "promote" in result.output.lower()
 
 
-# ── considered ────────────────────────────────────────────────────────────────
+# ── plan ──────────────────────────────────────────────────────────────────────
 
-def test_considered_found(
+def test_plan_returns_relevant_decisions(
+    runner: CliRunner, initialized_project: Path, store: DecisionStore, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    d = Decision(
+        id="ADR-0001",
+        title="Use Redis for caching",
+        status=Status.ACCEPTED,
+        created=datetime.date.today(),
+        confidence=Confidence.HIGH,
+        scope=Scope(tags=["cache"]),
+    )
+    store.save(d)
+    result = runner.invoke(main, ["plan", "add a redis caching layer"])
+    assert result.exit_code == 0
+    assert "RELEVANT DECISIONS" in result.output
+    assert "ADR-0001" in result.output
+
+
+def test_plan_includes_observed_entries(
+    runner: CliRunner, initialized_project: Path, store: DecisionStore, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    d = Decision(
+        id="ADR-0001",
+        title="Uses redis",
+        status=Status.OBSERVED,
+        created=datetime.date.today(),
+        confidence=Confidence.MEDIUM,
+        scope=Scope(tags=["redis"]),
+        observed_via=ObservedVia.SEED,
+    )
+    store.save(d)
+    result = runner.invoke(main, ["plan", "add a redis cache"])
+    assert result.exit_code == 0
+    assert "OBSERVED ENTRIES" in result.output
+    assert "ADR-0001" in result.output
+
+
+def test_plan_includes_considered_alternatives(
     runner: CliRunner, initialized_project: Path, store: DecisionStore, mocker
 ):
     mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
     from adr_agent.models import Alternative, Outcome, Reversible
     d = Decision(
         id="ADR-0001",
+        title="Use Postgres for jobs",
+        status=Status.ACCEPTED,
+        created=datetime.date.today(),
+        confidence=Confidence.MEDIUM,
+        scope=Scope(tags=["postgres"]),
+        alternatives=[Alternative("Redis queue", Outcome.NOT_CHOSEN, "Too simple", Reversible.CHEAP)],
+    )
+    store.save(d)
+    result = runner.invoke(main, ["plan", "add a postgres job queue"])
+    assert result.exit_code == 0
+    assert "WHAT HAS BEEN CONSIDERED" in result.output
+    assert "Redis queue" in result.output
+
+
+def test_plan_no_matches(
+    runner: CliRunner, initialized_project: Path, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    result = runner.invoke(main, ["plan", "xyzzy unknownthing"])
+    assert result.exit_code == 0
+    assert "No relevant decisions" in result.output
+
+
+def test_plan_logs_voluntary(
+    runner: CliRunner, initialized_project: Path, store: DecisionStore, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    sessions_dir = initialized_project / ".adr-agent" / "sessions"
+    from adr_agent.session import set_current_session_id, EventLogger
+    set_current_session_id(sessions_dir, "sess-test")
+    store.save(Decision(
+        id="ADR-0001",
+        title="Use Redis",
+        status=Status.ACCEPTED,
+        created=datetime.date.today(),
+        confidence=Confidence.MEDIUM,
+        scope=Scope(tags=["redis"]),
+    ))
+    runner.invoke(main, ["plan", "add a redis layer"])
+    log_file = sessions_dir / "sess-test.jsonl"
+    assert log_file.exists()
+    events = [json.loads(line) for line in log_file.read_text().splitlines() if line]
+    plan_events = [e for e in events if e["command"] == "plan"]
+    assert len(plan_events) == 1
+
+
+# ── rebuild-index ─────────────────────────────────────────────────────────────
+
+def test_rebuild_index_command(
+    runner: CliRunner, initialized_project: Path, store: DecisionStore, mocker
+):
+    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
+    store.save(Decision(
+        id="ADR-0001",
         title="Use Redis",
         status=Status.ACCEPTED,
         created=datetime.date.today(),
         confidence=Confidence.MEDIUM,
         scope=Scope(),
-        alternatives=[Alternative("Postgres", Outcome.NOT_CHOSEN, "Slower", Reversible.CHEAP)],
-    )
-    store.save(d)
-    result = runner.invoke(main, ["considered", "postgres"])
+    ))
+    result = runner.invoke(main, ["rebuild-index"])
     assert result.exit_code == 0
-    assert "NOT-CHOSEN" in result.output
-    assert "Postgres" in result.output
+    assert "rebuilt" in result.output.lower()
+    index = store._load_index()
+    assert "redis" in index
 
 
-def test_considered_not_found(
-    runner: CliRunner, initialized_project: Path, mocker
-):
-    mocker.patch("adr_agent.cli._find_project_root", return_value=initialized_project)
-    result = runner.invoke(main, ["considered", "unknownthing"])
+# ── first-run-audit ───────────────────────────────────────────────────────────
+
+def test_first_run_audit_command(runner: CliRunner):
+    result = runner.invoke(main, ["first-run-audit"])
     assert result.exit_code == 0
-    assert "No decisions" in result.output
+    assert "OBSERVED" in result.output
+    assert "promote" in result.output.lower()
 
 
 # ── history ───────────────────────────────────────────────────────────────────

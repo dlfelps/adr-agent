@@ -62,6 +62,13 @@ def test_session_start_sets_current_session(project_root: Path):
     assert sid == "sess-abc"
 
 
+def test_brief_contains_plan_hint(project_root: Path):
+    event = {"session_id": "sess-001"}
+    output = handle_session_start(event, project_root)
+    assert 'adr-agent plan' in output
+    assert 'considered' not in output
+
+
 def test_brief_separates_accepted_observed(project_root: Path, store: DecisionStore):
     import datetime
     accepted = Decision(
