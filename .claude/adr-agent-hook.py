@@ -43,7 +43,7 @@ def main():
         if r.returncode == 0:
             sys.exit(0)
 
-    print(f"[adr-agent] {_install_hint(bool(uv))}", file=sys.stderr)
+    print(f"[adr-agent] {_install_hint(bool(uv))}")
     sys.exit(0)
 
 
