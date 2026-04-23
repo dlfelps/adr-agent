@@ -453,7 +453,6 @@ def check_constraint(tag: str) -> None:
 @click.option("--relevant-adrs", default=None, help="Comma-separated ADR IDs relevant to this proposal.")
 @click.option("--path", "scope_path", default=None, help="File path scope hint.")
 @click.option("--title", default=None, help="Decision title (one sentence).")
-@click.option("--rationale", default=None, help="Rationale: what context led to this choice.")
 @click.option(
     "--confidence",
     "confidence_flag",
@@ -475,15 +474,14 @@ def check_constraint(tag: str) -> None:
     ),
 )
 @click.option("--yes", "-y", is_flag=True, help="Non-interactive: skip all prompts and use provided flags or defaults.")
-@click.option("--context", "context_prose", default=None, help="ADR context prose (bypasses LLM generation).")
-@click.option("--decision", "decision_prose", default=None, help="ADR decision prose (bypasses LLM generation).")
-@click.option("--consequences", "consequences_prose", default=None, help="ADR consequences prose (bypasses LLM generation).")
+@click.option("--context", "context_prose", default=None, help="ADR context prose (background and problem).")
+@click.option("--decision", "decision_prose", default=None, help="ADR decision prose (what was decided).")
+@click.option("--consequences", "consequences_prose", default=None, help="ADR consequences prose (outcomes, positive and negative).")
 def propose(
     dependency: Optional[str],
     relevant_adrs: Optional[str],
     scope_path: Optional[str],
     title: Optional[str],
-    rationale: Optional[str],
     confidence_flag: Optional[str],
     tags: Optional[str],
     paths_flag: Optional[str],
@@ -516,10 +514,13 @@ def propose(
     if yes:
         if not title:
             raise click.UsageError("--title is required when using --yes.")
-        if not rationale:
-            raise click.UsageError("--rationale is required when using --yes.")
+        if not context_prose:
+            raise click.UsageError("--context is required when using --yes.")
+        if not decision_prose:
+            raise click.UsageError("--decision is required when using --yes.")
+        if not consequences_prose:
+            raise click.UsageError("--consequences is required when using --yes.")
         title_val = title
-        rationale_val = rationale
         confidence = Confidence(confidence_flag or "medium")
         tags_raw = tags or default_scope_tags
         paths_raw = paths_flag or default_scope_paths
@@ -527,7 +528,6 @@ def propose(
         supersedes_raw = supersedes or ""
     else:
         title_val = click.prompt("Decision title (one sentence)", default=title or default_title or "")
-        rationale_val = click.prompt("Rationale (what context led to this choice)", default=rationale or "")
         confidence_raw = click.prompt(
             "Confidence",
             type=click.Choice(["low", "medium", "high"]),
@@ -538,6 +538,12 @@ def propose(
         paths_raw = click.prompt("Scope paths (comma-separated, or empty)", default=paths_flag or default_scope_paths)
         constraints_raw = click.prompt("Constraints depended on (comma-separated, or empty)", default=constraints or "")
         supersedes_raw = click.prompt("Supersedes (ADR IDs, comma-separated, or empty)", default=supersedes or "")
+        if context_prose is None:
+            context_prose = click.prompt("Context (background and problem that prompted this decision)", default="")
+        if decision_prose is None:
+            decision_prose = click.prompt("Decision (what was decided)", default="")
+        if consequences_prose is None:
+            consequences_prose = click.prompt("Consequences (outcomes, positive and negative)", default="")
 
     tag_list = [t.strip() for t in tags_raw.split(",") if t.strip()]
     path_list = [p.strip() for p in paths_raw.split(",") if p.strip()]
@@ -583,19 +589,7 @@ def propose(
                 )
             )
 
-    # Generate prose body — use supplied prose directly if all three sections provided
-    alt_summary = "; ".join(f"{a.name} ({a.outcome.value})" for a in alternatives) if alternatives else ""
-    if context_prose is not None and decision_prose is not None and consequences_prose is not None:
-        context_text, decision_text, consequences_text = context_prose, decision_prose, consequences_prose
-    else:
-        client = llm_module.get_client()
-        context_text, decision_text, consequences_text = client.generate_adr_body(
-            title=title_val,
-            rationale=rationale_val,
-            alternatives_summary=alt_summary,
-            constraints=constraint_list,
-            supersedes=supersedes_list,
-        )
+    context_text, decision_text, consequences_text = context_prose or "", decision_prose or "", consequences_prose or ""
 
     adr_id = store.next_id()
     from .models import Decision

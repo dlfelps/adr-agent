@@ -4,8 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "adr-agent"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Per-repository architectural memory for AI agents"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "click>=8.0",
@@ -16,6 +17,9 @@ dependencies = [
 
 [project.scripts]
 adr-agent = "adr_agent.cli:main"
+
+[tool.hatch.version]
+path = "src/adr_agent/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/adr_agent"]
